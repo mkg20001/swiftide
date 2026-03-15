@@ -49,6 +49,7 @@ temp-dir.workspace = true
 insta.workspace = true
 rmcp = { workspace = true, features = ["server"] }
 schemars = { workspace = true }
+trybuild = "1"
 
 [lints]
 workspace = true
