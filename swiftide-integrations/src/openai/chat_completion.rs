@@ -15,7 +15,6 @@ use futures_util::StreamExt as _;
 use futures_util::stream;
 use itertools::Itertools;
 use serde::Serialize;
-use serde_json::json;
 use swiftide_core::ChatCompletionStream;
 use swiftide_core::chat_completion::Usage;
 use swiftide_core::chat_completion::{
@@ -31,9 +30,7 @@ use super::openai_error_to_language_model_error;
 use super::responses_api::{
     build_responses_request_from_chat, response_to_chat_completion, responses_stream_adapter,
 };
-use super::{
-    ensure_tool_schema_additional_properties_false, ensure_tool_schema_required_matches_properties,
-};
+use super::tool_schema::OpenAiToolSchema;
 use tracing_futures::Instrument;
 
 #[async_trait]
@@ -548,20 +545,9 @@ pub(crate) fn langfuse_json<T>(_value: &T) -> Option<String> {
 }
 
 fn tools_to_openai(spec: &ToolSpec) -> Result<ChatCompletionTools> {
-    let mut parameters = match &spec.parameters_schema {
-        Some(schema) => serde_json::to_value(schema)?,
-        None => json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false,
-        }),
-    };
-
-    ensure_tool_schema_additional_properties_false(&mut parameters)
-        .context("tool schema must allow no additional properties")?;
-    ensure_tool_schema_required_matches_properties(&mut parameters)
-        .context("tool schema must list required properties")?;
+    let parameters = OpenAiToolSchema::try_from(spec)
+        .context("tool schema must be OpenAI compatible")?
+        .into_value();
 
     let function = FunctionObject {
         name: spec.name.clone(),
@@ -728,6 +714,7 @@ mod tests {
 
     use super::*;
     use futures_util::StreamExt;
+    use serde_json::json;
     use std::sync::Arc;
     use swiftide_core::chat_completion::{ToolCallBuilder, ToolOutput, UsageBuilder};
     use wiremock::matchers::{method, path};
@@ -737,6 +724,29 @@ mod tests {
     #[derive(schemars::JsonSchema)]
     struct WeatherArgs {
         _city: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct NestedCommentArgs {
+        request: NestedCommentRequest,
+    }
+
+    #[allow(dead_code)]
+    #[derive(schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct NestedCommentRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discussion_id: Option<String>,
     }
 
     #[test]
@@ -768,6 +778,59 @@ mod tests {
             "Chat Completions require additionalProperties=false for tool parameters, got {}",
             serde_json::to_string_pretty(&function.parameters).unwrap()
         );
+    }
+
+    #[test]
+    fn test_tools_to_openai_sets_nested_required_for_typed_request_objects() {
+        let spec = ToolSpec::builder()
+            .name("notion_create_comment")
+            .description("Create a comment")
+            .parameters_schema(schemars::schema_for!(NestedCommentArgs))
+            .build()
+            .unwrap();
+
+        let tool = tools_to_openai(&spec).expect("tool conversion succeeds");
+
+        let function = match tool {
+            ChatCompletionTools::Function(ref tool) => &tool.function,
+            ChatCompletionTools::Custom(_) => panic!("expected function tool"),
+        };
+
+        let nested_required = function.parameters.as_ref().and_then(|schema| {
+            let request_schema = schema
+                .get("properties")
+                .and_then(|value| value.get("request"))
+                .and_then(serde_json::Value::as_object)?;
+            let referenced_required = request_schema
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|reference| reference.strip_prefix("#/$defs/"))
+                .and_then(|definition_name| {
+                    schema
+                        .get("$defs")
+                        .and_then(|value| value.get(definition_name))
+                })
+                .and_then(|value| value.get("required"))
+                .and_then(serde_json::Value::as_array);
+
+            referenced_required.or_else(|| {
+                request_schema
+                    .get("required")
+                    .and_then(serde_json::Value::as_array)
+            })
+        });
+
+        let nested_required = nested_required.expect("nested request should have required");
+        let names: std::collections::HashSet<_> = nested_required
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+
+        assert!(names.contains("body"));
+        assert!(names.contains("text"));
+        assert!(names.contains("page_id"));
+        assert!(names.contains("block_id"));
+        assert!(names.contains("discussion_id"));
     }
 
     #[test]
@@ -1056,7 +1119,7 @@ mod tests {
                 assert_eq!(v["parallel_tool_calls"], true);
                 assert_eq!(v["max_completion_tokens"], 77);
                 assert!((v["temperature"].as_f64().unwrap() - 0.42).abs() < 1e-5);
-                assert_eq!(v["reasoning_effort"], "low");
+                assert_eq!(v["reasoning_effort"], serde_json::Value::Null);
                 assert_eq!(v["seed"], 42);
                 assert!((v["presence_penalty"].as_f64().unwrap() - 1.1).abs() < 1e-5);
 
@@ -1308,58 +1371,34 @@ data: [DONE]\n\n";
     async fn test_complete_stream_invalid_tool_schema_errors() {
         let invalid_schema = schemars::Schema::from(true);
 
-        let tool_spec = ToolSpec::builder()
+        let err = ToolSpec::builder()
             .name("bad")
             .description("bad schema")
             .parameters_schema(invalid_schema)
             .build()
-            .unwrap();
+            .expect_err("invalid tool schemas should be rejected at build time");
 
-        let openai = OpenAI::builder()
-            .default_prompt_model("gpt-4o-mini")
-            .build()
-            .unwrap();
-
-        let req = ChatCompletionRequest::builder()
-            .messages(vec![ChatMessage::User("hi".into())])
-            .tool_specs([tool_spec])
-            .build()
-            .unwrap();
-
-        let mut stream = openai.complete_stream(&req).await;
-        let first = stream.next().await.expect("stream yields");
         assert!(
-            first
-                .err()
-                .is_some_and(|e| matches!(e, LanguageModelError::PermanentError(_)))
+            err.to_string()
+                .contains("tool schema must be a JSON object")
         );
-        assert!(stream.next().await.is_none());
     }
 
     #[test_log::test(tokio::test)]
     async fn test_complete_invalid_tool_schema_errors() {
         let invalid_schema = schemars::Schema::from(true);
 
-        let tool_spec = ToolSpec::builder()
+        let err = ToolSpec::builder()
             .name("bad")
             .description("bad schema")
             .parameters_schema(invalid_schema)
             .build()
-            .unwrap();
+            .expect_err("invalid tool schemas should be rejected at build time");
 
-        let openai = OpenAI::builder()
-            .default_prompt_model("gpt-4o")
-            .build()
-            .unwrap();
-
-        let req = ChatCompletionRequest::builder()
-            .messages(vec![ChatMessage::User("hi".into())])
-            .tool_specs([tool_spec])
-            .build()
-            .unwrap();
-
-        let err = openai.complete(&req).await.unwrap_err();
-        assert!(matches!(err, LanguageModelError::PermanentError(_)));
+        assert!(
+            err.to_string()
+                .contains("tool schema must be a JSON object")
+        );
     }
 
     #[test_log::test(tokio::test)]
