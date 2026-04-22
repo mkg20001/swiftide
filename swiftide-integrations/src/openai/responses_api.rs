@@ -151,6 +151,7 @@ fn tool_spec_to_responses_tool(spec: &ToolSpec) -> Result<Tool> {
         parameters: Some(parameters),
         strict: Some(true),
         description: Some(spec.description.clone()),
+        defer_loading: None,
     };
 
     Ok(Tool::Function(function))
@@ -190,6 +191,7 @@ fn chat_messages_to_input_items(
                             name: tool_call.name().to_owned(),
                             id: None,
                             status: Some(OutputStatus::InProgress),
+                            namespace: None,
                         };
 
                         items.push(InputItem::Item(
